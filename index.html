@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>27b</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #ffffff;
+      --panel: #2b2b2e;
+      --panel-row: #37373b;
+      --panel-text: #c8c8cc;
+      --panel-strong: #e6e6ea;
+      --control: #505056;
+      --control-hover: #5d5d64;
+      --button: #c8c8cc;
+      --button-text: #1c1c1f;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
+    canvas#stage { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: crosshair; }
+
+    /* ---------- Debug panel (styled after Tweakpane) ---------- */
+    .pane {
+      position: fixed; top: 12px; right: 12px; width: 348px; max-width: calc(100vw - 24px);
+      background: var(--panel); color: var(--panel-text); border-radius: 6px;
+      font: 12px/1.2 "JetBrains Mono", ui-monospace, Menlo, monospace;
+      box-shadow: 0 2px 8px rgba(0,0,0,.25); user-select: none; overflow: hidden;
+    }
+    .folder > .title {
+      display: flex; justify-content: space-between; align-items: center;
+      width: 100%; padding: 8px 10px; background: none; border: 0; color: var(--panel-strong);
+      font: inherit; text-align: left; cursor: pointer;
+    }
+    .folder > .title::after { content: "▾"; opacity: .6; transition: transform .15s; }
+    .folder.closed > .title::after { transform: rotate(-90deg); }
+    .folder.closed > .body { display: none; }
+    .folder .folder > .title { background: var(--panel-row); }
+    .row { display: grid; grid-template-columns: 110px 1fr; align-items: center; gap: 6px; padding: 4px 10px; }
+    .row label { opacity: .85; }
+    .row button.action {
+      background: var(--button); color: var(--button-text); border: 0; border-radius: 2px;
+      padding: 6px; font: 600 12px "JetBrains Mono", monospace; cursor: pointer;
+    }
+    .row button.action:hover { filter: brightness(1.08); }
+    .row select {
+      width: 100%; background: var(--button); color: var(--button-text); border: 0; border-radius: 2px;
+      padding: 5px 6px; font: 600 12px "JetBrains Mono", monospace; cursor: pointer;
+    }
+    .slider { display: grid; grid-template-columns: 1fr 64px; gap: 8px; align-items: center; }
+    .slider input[type=range] { width: 100%; accent-color: var(--panel-text); cursor: pointer; }
+    .slider input[type=number] {
+      width: 100%; background: var(--control); color: var(--panel-strong); border: 0; border-radius: 2px;
+      padding: 5px 6px; font: inherit; text-align: right;
+    }
+    .slider input[type=number]:hover { background: var(--control-hover); }
+    .toast {
+      position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px);
+      background: #111; color: #fff; padding: 8px 14px; border-radius: 4px; opacity: 0;
+      font: 12px "JetBrains Mono", monospace; transition: opacity .2s, transform .2s; pointer-events: none;
+    }
+    .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+    .fallback { position: fixed; inset: 0; display: none; place-items: center; font: 800 30vw/1 Inter, Helvetica, sans-serif; }
+    @media (max-width: 480px) {
+      .pane { top: auto; bottom: 12px; right: 12px; left: 12px; width: auto; }
+      .row { grid-template-columns: 90px 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <canvas id="stage"></canvas>
+  <div class="fallback" id="fallback">27b</div>
+
+  <div class="pane" id="pane">
+    <div class="folder" id="root">
+      <button class="title" type="button">Debug</button>
+      <div class="body">
+        <div class="folder">
+          <button class="title" type="button">effects</button>
+          <div class="body">
+            <div class="row"><label>share</label><button class="action" id="share" type="button">Share effect</button></div>
+            <div class="row"><label for="effect">effect</label><select id="effect"></select></div>
+          </div>
+        </div>
+        <div class="folder">
+          <button class="title" type="button" id="paramsTitle">Mouse Grid</button>
+          <div class="body" id="params"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="toast" id="toast"></div>
+
+  <script>
+  // =====================================================================
+  //  27b: an interactive logo.
+  //
+  //  How it works:
+  //   1. We draw the "27b" text onto a hidden 2D canvas. That becomes a
+  //      texture (an image the GPU can read).
+  //   2. We keep a small grid (e.g. 30 x 30 cells) in JavaScript. When the
+  //      mouse moves, cells near the pointer store the mouse's velocity.
+  //      Every frame each cell is multiplied by "dissipation" (< 1) so the
+  //      trail fades away on its own.
+  //   3. A WebGL shader draws the logo, but for every pixel it looks up the
+  //      grid cell it's in and shifts where it reads the logo from. Because
+  //      the grid is coarse, the logo breaks into blocks.
+  // =====================================================================
+
+  // ---------- Effects and their settings ----------
+  // Each effect uses the same grid, but the shader reads it differently.
+  const EFFECTS = {
+    MouseGrid: {
+      label: 'Mouse Grid',
+      mode: 0,
+      params: {
+        gridSize:    { label: 'Grid size',    value: 30,    min: 4,    max: 60,  step: 1 },
+        mouseRadius: { label: 'Mouse Radius', value: 0.141, min: 0.01, max: 0.5, step: 0.001 },
+        dissipation: { label: 'Dissipation',  value: 0.88,  min: 0.5,  max: 0.99, step: 0.01 },
+        strength:    { label: 'Strength',     value: 0.6,   min: 0,    max: 3,   step: 0.01 },
+      },
+    },
+    Liquid: {
+      label: 'Liquid',
+      mode: 1,
+      params: {
+        gridSize:    { label: 'Grid size',    value: 24,    min: 4,    max: 60,  step: 1 },
+        mouseRadius: { label: 'Mouse Radius', value: 0.2,   min: 0.01, max: 0.5, step: 0.001 },
+        dissipation: { label: 'Dissipation',  value: 0.94,  min: 0.5,  max: 0.99, step: 0.01 },
+        strength:    { label: 'Strength',     value: 0.5,   min: 0,    max: 3,   step: 0.01 },
+      },
+    },
+    PixelTrail: {
+      label: 'Pixel Trail',
+      mode: 2,
+      params: {
+        gridSize:    { label: 'Grid size',    value: 40,    min: 4,    max: 80,  step: 1 },
+        mouseRadius: { label: 'Mouse Radius', value: 0.12,  min: 0.01, max: 0.5, step: 0.001 },
+        dissipation: { label: 'Dissipation',  value: 0.92,  min: 0.5,  max: 0.99, step: 0.01 },
+        pixelSize:   { label: 'Pixel size',   value: 40,    min: 4,    max: 120, step: 1 },
+      },
+    },
+    RGBSplit: {
+      label: 'RGB Split',
+      mode: 3,
+      params: {
+        gridSize:    { label: 'Grid size',    value: 20,    min: 4,    max: 60,  step: 1 },
+        mouseRadius: { label: 'Mouse Radius', value: 0.18,  min: 0.01, max: 0.5, step: 0.001 },
+        dissipation: { label: 'Dissipation',  value: 0.9,   min: 0.5,  max: 0.99, step: 0.01 },
+        strength:    { label: 'Strength',     value: 0.8,   min: 0,    max: 3,   step: 0.01 },
+      },
+    },
+  };
+
+  let currentEffect = 'MouseGrid';
+  const settings = {}; // settings[effectName][paramName] = number
+  for (const [name, fx] of Object.entries(EFFECTS)) {
+    settings[name] = {};
+    for (const [key, p] of Object.entries(fx.params)) settings[name][key] = p.value;
+  }
+
+  // Read settings from the URL so "Share effect" links reopen the same look.
+  (function readUrl() {
+    const q = new URLSearchParams(location.search);
+    const fx = q.get('effect');
+    if (fx && EFFECTS[fx]) currentEffect = fx;
+    for (const [key, p] of Object.entries(EFFECTS[currentEffect].params)) {
+      const v = parseFloat(q.get(key));
+      if (Number.isFinite(v)) settings[currentEffect][key] = Math.min(p.max, Math.max(p.min, v));
+    }
+  })();
+
+  const S = () => settings[currentEffect];
+
+  // ---------- WebGL setup ----------
+  const canvas = document.getElementById('stage');
+  const gl = canvas.getContext('webgl2', { antialias: false, premultipliedAlpha: false });
+  if (!gl) {
+    document.getElementById('fallback').style.display = 'grid';
+    canvas.style.display = 'none';
+    throw new Error('WebGL2 not supported');
+  }
+
+  const VERT = `#version 300 es
+  in vec2 aPos;
+  out vec2 vUv;
+  void main() {
+    vUv = aPos * 0.5 + 0.5;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+  }`;
+
+  const FRAG = `#version 300 es
+  precision highp float;
+  in vec2 vUv;
+  out vec4 outColor;
+
+  uniform sampler2D uLogo;   // the "27b" picture
+  uniform sampler2D uGrid;   // rg = push direction, b = how "active" the cell is
+  uniform int   uMode;       // which effect
+  uniform float uStrength;
+  uniform float uPixel;      // pixel size for Pixel Trail (in screen pixels)
+  uniform vec2  uRes;        // canvas size in pixels
+
+  vec3 logo(vec2 uv) {
+    // Outside the picture is plain white.
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return vec3(1.0);
+    return texture(uLogo, uv).rgb;
+  }
+
+  void main() {
+    vec4 g = texture(uGrid, vUv);
+    vec2 offset = g.rg * 0.02 * uStrength;
+
+    if (uMode == 0 || uMode == 1) {
+      // Mouse Grid (blocky) and Liquid (smooth): shift where we read the logo.
+      outColor = vec4(logo(vUv - offset), 1.0);
+    } else if (uMode == 2) {
+      // Pixel Trail: snap the lookup to big squares where the mouse has been.
+      float size = mix(1.0, uPixel, clamp(g.b, 0.0, 1.0));
+      vec2 px = floor(vUv * uRes / size) * size + size * 0.5;
+      outColor = vec4(logo(px / uRes), 1.0);
+    } else {
+      // RGB Split: read red, green and blue from slightly different places.
+      float r = logo(vUv - offset).r;
+      float gg = logo(vUv).g;
+      float b = logo(vUv + offset).b;
+      outColor = vec4(r, gg, b, 1.0);
+    }
+  }`;
+
+  function compile(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  }
+  const program = gl.createProgram();
+  gl.attachShader(program, compile(gl.VERTEX_SHADER, VERT));
+  gl.attachShader(program, compile(gl.FRAGMENT_SHADER, FRAG));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+  gl.useProgram(program);
+
+  // One big triangle pair covering the screen.
+  const quad = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), gl.STATIC_DRAW);
+  const aPos = gl.getAttribLocation(program, 'aPos');
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+  const u = name => gl.getUniformLocation(program, name);
+  const uniforms = {
+    logo: u('uLogo'), grid: u('uGrid'), mode: u('uMode'),
+    strength: u('uStrength'), pixel: u('uPixel'), res: u('uRes'),
+  };
+  gl.uniform1i(uniforms.logo, 0);
+  gl.uniform1i(uniforms.grid, 1);
+
+  // ---------- Logo texture ----------
+  const logoCanvas = document.createElement('canvas');
+  const logoCtx = logoCanvas.getContext('2d');
+  const logoTex = gl.createTexture();
+
+  function drawLogo() {
+    const w = canvas.width, h = canvas.height;
+    logoCanvas.width = w;
+    logoCanvas.height = h;
+    logoCtx.fillStyle = '#fff';
+    logoCtx.fillRect(0, 0, w, h);
+    logoCtx.fillStyle = '#000';
+    logoCtx.textAlign = 'center';
+    logoCtx.textBaseline = 'alphabetic';
+
+    // Pick a font size so the word fills ~70% of the width (and fits the height).
+    const family = '800 100px Inter, "Helvetica Neue", Helvetica, Arial, sans-serif';
+    logoCtx.font = family;
+    const m = logoCtx.measureText('27b');
+    const textH = m.actualBoundingBoxAscent + m.actualBoundingBoxDescent;
+    const scale = Math.min((w * 0.7) / m.width, (h * 0.6) / textH);
+    logoCtx.font = family.replace('100px', `${100 * scale}px`);
+    logoCtx.letterSpacing = `${-4 * scale}px`;
+    const baseline = h / 2 + (m.actualBoundingBoxAscent - m.actualBoundingBoxDescent) * scale / 2;
+    logoCtx.fillText('27b', w / 2, baseline);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, logoTex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, logoCanvas);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+
+  // ---------- The grid (the "memory" of the mouse) ----------
+  const gridTex = gl.createTexture();
+  let gridN = 0;
+  let gridData = new Float32Array(0);
+
+  function resetGrid() {
+    gridN = Math.round(S().gridSize);
+    gridData = new Float32Array(gridN * gridN * 4);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, gridTex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, gridN, gridN, 0, gl.RGBA, gl.FLOAT, gridData);
+    applyGridFilter();
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+
+  // NEAREST keeps hard square blocks; LINEAR blends between cells (Liquid).
+  function applyGridFilter() {
+    const f = currentEffect === 'Liquid' ? gl.LINEAR : gl.NEAREST;
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, gridTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, f);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, f);
+  }
+
+  // ---------- Mouse / touch ----------
+  const mouse = { x: 0.5, y: 0.5, vx: 0, vy: 0, px: null, py: null };
+
+  function onMove(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    const x = (clientX - r.left) / r.width;
+    const y = 1 - (clientY - r.top) / r.height; // flip so y goes up, like the shader
+    if (mouse.px !== null) {
+      mouse.vx = x - mouse.px;
+      mouse.vy = y - mouse.py;
+    }
+    mouse.x = mouse.px = x;
+    mouse.y = mouse.py = y;
+  }
+  window.addEventListener('pointermove', e => onMove(e.clientX, e.clientY));
+  window.addEventListener('pointerleave', () => { mouse.px = mouse.py = null; });
+
+  function updateGrid() {
+    const { mouseRadius, dissipation } = S();
+    const aspect = canvas.width / canvas.height;
+    const maxDist = gridN * mouseRadius;
+    const speed = 100; // turns tiny mouse deltas into useful numbers
+
+    for (let i = 0; i < gridN; i++) {       // column
+      for (let j = 0; j < gridN; j++) {     // row
+        const k = 4 * (i + gridN * j);
+        // Fade out what was there before.
+        gridData[k]     *= dissipation;
+        gridData[k + 1] *= dissipation;
+        gridData[k + 2] *= dissipation;
+
+        // Distance from this cell to the mouse, in grid cells, corrected for
+        // the screen being wider than it is tall so the brush stays round.
+        const dx = (mouse.x * gridN - i - 0.5) * aspect;
+        const dy = (mouse.y * gridN - j - 0.5);
+        const d2 = dx * dx + dy * dy;
+        if (d2 < maxDist * maxDist) {
+          const power = Math.min(maxDist / Math.sqrt(d2 || 1e-4), 10);
+          gridData[k]     += mouse.vx * speed * power;
+          gridData[k + 1] += mouse.vy * speed * power;
+          const moving = Math.min(1, Math.hypot(mouse.vx, mouse.vy) * 60);
+          gridData[k + 2] = Math.min(1, gridData[k + 2] + moving * (1 - Math.sqrt(d2) / maxDist));
+        }
+      }
+    }
+    // Velocity only counts for one frame.
+    mouse.vx *= 0.9;
+    mouse.vy *= 0.9;
+
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, gridTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gridN, gridN, gl.RGBA, gl.FLOAT, gridData);
+  }
+
+  // ---------- Resize ----------
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(canvas.clientWidth * dpr);
+    canvas.height = Math.round(canvas.clientHeight * dpr);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    drawLogo();
+  }
+  window.addEventListener('resize', resize);
+
+  // ---------- Render loop ----------
+  function frame() {
+    if (Math.round(S().gridSize) !== gridN) resetGrid();
+    updateGrid();
+    const fx = EFFECTS[currentEffect];
+    gl.uniform1i(uniforms.mode, fx.mode);
+    gl.uniform1f(uniforms.strength, S().strength ?? 1);
+    gl.uniform1f(uniforms.pixel, (S().pixelSize ?? 1) * Math.min(window.devicePixelRatio || 1, 2));
+    gl.uniform2f(uniforms.res, canvas.width, canvas.height);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    requestAnimationFrame(frame);
+  }
+
+  // ---------- Debug panel ----------
+  const effectSelect = document.getElementById('effect');
+  const paramsEl = document.getElementById('params');
+  const paramsTitle = document.getElementById('paramsTitle');
+
+  for (const name of Object.keys(EFFECTS)) {
+    const opt = document.createElement('option');
+    opt.value = opt.textContent = name;
+    effectSelect.appendChild(opt);
+  }
+  effectSelect.value = currentEffect;
+  effectSelect.addEventListener('change', () => {
+    currentEffect = effectSelect.value;
+    buildParams();
+    resetGrid();
+  });
+
+  function decimals(step) {
+    const s = String(step);
+    return s.includes('.') ? s.split('.')[1].length : 0;
+  }
+
+  function buildParams() {
+    const fx = EFFECTS[currentEffect];
+    paramsTitle.textContent = fx.label;
+    paramsEl.innerHTML = '';
+    for (const [key, p] of Object.entries(fx.params)) {
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.innerHTML = `
+        <label for="p-${key}">${p.label}</label>
+        <div class="slider">
+          <input type="range" id="p-${key}" min="${p.min}" max="${p.max}" step="${p.step}">
+          <input type="number" min="${p.min}" max="${p.max}" step="${p.step}" aria-label="${p.label}">
+        </div>`;
+      const [range, num] = row.querySelectorAll('input');
+      const set = v => {
+        v = Math.min(p.max, Math.max(p.min, parseFloat(v)));
+        if (!Number.isFinite(v)) return;
+        settings[currentEffect][key] = v;
+        range.value = v;
+        num.value = v.toFixed(decimals(p.step));
+      };
+      set(settings[currentEffect][key]);
+      range.addEventListener('input', () => set(range.value));
+      num.addEventListener('change', () => set(num.value));
+      paramsEl.appendChild(row);
+    }
+    applyGridFilter();
+  }
+
+  // Collapsible folders.
+  document.querySelectorAll('.folder > .title').forEach(btn => {
+    btn.addEventListener('click', () => btn.parentElement.classList.toggle('closed'));
+  });
+
+  // Share: copy a link that includes the current effect and settings.
+  const toast = document.getElementById('toast');
+  function showToast(msg) {
+    toast.textContent = msg;
+    toast.classList.add('show');
+    clearTimeout(showToast.t);
+    showToast.t = setTimeout(() => toast.classList.remove('show'), 1800);
+  }
+  document.getElementById('share').addEventListener('click', async () => {
+    const q = new URLSearchParams({ effect: currentEffect });
+    for (const [k, v] of Object.entries(S())) q.set(k, v);
+    const url = `${location.origin}${location.pathname}?${q}`;
+    history.replaceState(null, '', `?${q}`);
+    try {
+      await navigator.clipboard.writeText(url);
+      showToast('Link copied');
+    } catch {
+      showToast('Link is in the address bar');
+    }
+  });
+
+  // Press "h" to hide/show the panel.
+  window.addEventListener('keydown', e => {
+    if (e.key === 'h' && !e.target.closest('input, select')) {
+      const pane = document.getElementById('pane');
+      pane.style.display = pane.style.display === 'none' ? '' : 'none';
+    }
+  });
+
+  // ---------- Start ----------
+  buildParams();
+  resize();
+  resetGrid();
+  requestAnimationFrame(frame);
+  // Redraw once the web font has loaded so the logo uses Inter, not the fallback.
+  document.fonts.load('800 100px Inter').then(drawLogo).catch(() => {});
+  </script>
+</body>
+</html>
