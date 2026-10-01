@@ -21,11 +21,12 @@
     }
     * { box-sizing: border-box; }
     html, body { margin: 0; height: 100%; background: #ffffff; overflow: hidden; }
-    canvas#stage { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: crosshair; }
+    canvas#stage { position: fixed; inset: 0; display: block; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
+    [hidden] { display: none !important; }
 
     /* ---------- Debug panel (styled after Tweakpane) ---------- */
     .pane {
-      position: fixed; top: 12px; right: 12px; width: 348px; max-width: calc(100vw - 24px);
+      position: fixed; top: calc(12px + env(safe-area-inset-top, 0px)); right: 12px; width: 348px; color-scheme: dark; max-width: calc(100vw - 24px);
       max-height: calc(100vh - 24px); overflow-y: auto;
       background: var(--panel); color: var(--panel-text); border-radius: 6px;
       font: 12px/1.2 "JetBrains Mono", ui-monospace, Menlo, monospace;
@@ -73,6 +74,11 @@
       padding: 5px 6px; font: inherit; text-align: right;
     }
     .slider input[type=number]:hover { background: var(--control-hover); }
+    .share-link { padding: 0 10px 8px; }
+    .share-link input {
+      width: 100%; background: var(--control); color: var(--panel-strong); border: 0; border-radius: 2px;
+      padding: 5px 6px; font: inherit;
+    }
     .hint { padding: 2px 10px 8px; opacity: .55; font-size: 11px; }
     .toast {
       position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px);
@@ -80,7 +86,7 @@
       font: 12px "JetBrains Mono", monospace; transition: opacity .2s, transform .2s; pointer-events: none;
     }
     .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
-    .fallback { position: fixed; inset: 0; display: none; place-items: center; font: 800 30vw/1 Inter, Helvetica, sans-serif; }
+    .fallback { position: fixed; inset: 0; display: grid; place-items: center; font: 800 30vw/1 Inter, Helvetica, sans-serif; }
     @media (max-width: 480px) {
       .pane { top: auto; bottom: 12px; right: 12px; left: 12px; width: auto; max-height: 50vh; }
       .row { grid-template-columns: 90px 1fr; }
@@ -89,7 +95,7 @@
 </head>
 <body>
   <canvas id="stage"></canvas>
-  <div class="fallback" id="fallback">27b</div>
+  <div class="fallback" id="fallback" hidden>27b</div>
 
   <div class="pane" id="pane">
     <div class="folder" id="root">
@@ -114,6 +120,7 @@
           <button class="title" type="button">effects</button>
           <div class="body">
             <div class="row"><label>share</label><button class="action" id="share" type="button">Share effect</button></div>
+            <div class="share-link" id="shareRow" hidden><input id="shareLink" readonly aria-label="Share link"></div>
             <div class="row"><label for="effect">effect</label><select id="effect"></select></div>
           </div>
         </div>
@@ -191,9 +198,32 @@
   const logo = { text: '27b', font: 'Inter', fg: '#000000', bg: '#ffffff' };
   const isHex = v => /^#[0-9a-f]{6}$/i.test(v);
 
-  // Read settings from the URL so "Share effect" links reopen the same look.
+  // Where shared links should point. Left empty, it's this page's own address.
+  // (The claude.ai artifact copy sets this to the artifact's link.)
+  const SHARE_BASE = '';
+
+  // Shared links keep every setting in one "#token" after the address: the
+  // settings as text, turned into letters, digits, "-" and "_" (base64url).
+  function encodeSettings(obj) {
+    const bytes = new TextEncoder().encode(new URLSearchParams(obj).toString());
+    let bin = '';
+    bytes.forEach(b => { bin += String.fromCharCode(b); });
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+  function decodeSettings(token) {
+    try {
+      const bin = atob(token.replace(/-/g, '+').replace(/_/g, '/'));
+      return new URLSearchParams(new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0))));
+    } catch {
+      return new URLSearchParams();
+    }
+  }
+
+  // Read settings from the link so "Share effect" links reopen the same look.
+  // Older links put them after a "?" instead, so those still work too.
   (function readUrl() {
-    const q = new URLSearchParams(location.search);
+    const hash = location.hash.slice(1);
+    const q = hash ? decodeSettings(hash) : new URLSearchParams(location.search);
     const fx = q.get('effect');
     if (fx && EFFECTS[fx]) currentEffect = fx;
     for (const [key, p] of Object.entries(EFFECTS[currentEffect].params)) {
@@ -210,8 +240,8 @@
   const canvas = document.getElementById('stage');
   const gl = canvas.getContext('webgl2', { antialias: false, premultipliedAlpha: false });
   if (!gl) {
-    document.getElementById('fallback').style.display = 'grid';
-    canvas.style.display = 'none';
+    document.getElementById('fallback').hidden = false;
+    canvas.hidden = true;
     throw new Error('WebGL2 not supported');
   }
 
@@ -636,16 +666,21 @@
     showToast.t = setTimeout(() => toast.classList.remove('show'), 1800);
   }
   document.getElementById('share').addEventListener('click', async () => {
-    const q = new URLSearchParams({ effect: currentEffect });
-    for (const [k, v] of Object.entries(S())) q.set(k, v);
-    for (const [k, v] of Object.entries(logo)) q.set(k, v);
-    const url = `${location.origin}${location.pathname}?${q}`;
-    history.replaceState(null, '', `?${q}`);
+    const token = encodeSettings({ effect: currentEffect, ...S(), ...logo });
+    const base = SHARE_BASE || `${location.origin}${location.pathname}`;
+    const url = `${base}#${token}`;
+    try { history.replaceState(null, '', `#${token}`); } catch {}
+    // Show the link too, in case copying isn't allowed here.
+    const field = document.getElementById('shareLink');
+    field.value = url;
+    document.getElementById('shareRow').hidden = false;
     try {
       await navigator.clipboard.writeText(url);
       showToast('Link copied');
     } catch {
-      showToast('Link is in the address bar');
+      field.focus();
+      field.select();
+      showToast('Copy the link below the button');
     }
   });
 
@@ -653,7 +688,7 @@
   window.addEventListener('keydown', e => {
     if (e.key === 'h' && !e.target.closest('input, select, textarea')) {
       const pane = document.getElementById('pane');
-      pane.style.display = pane.style.display === 'none' ? '' : 'none';
+      pane.hidden = !pane.hidden;
     }
   });
 
